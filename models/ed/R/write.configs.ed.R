@@ -26,37 +26,37 @@ PREFIX_XML <- '<?xml version="1.0"?>\n<!DOCTYPE config SYSTEM "ed.dtd">\n'
 ##' @title Convert samples for ed
 ##' @param trait.samples a matrix or dataframe of samples from the trait distribution
 ##' @return matrix or dataframe with values transformed
-##' @author Shawn Serbin, David LeBauer, Carl Davidson
+##' @author Shawn Serbin, David LeBauer, Carl Davidson, Ryan Kelly
 convert.samples.ED <- function(trait.samples){
   DEFAULT.LEAF.C <- 0.48
   DEFAULT.MAINTENANCE.RESPIRATION <- 1/2
   ## convert SLA from m2 / kg leaf to m2 / kg C 
   
   if('SLA' %in% names(trait.samples)){
-    sla <- trait.samples[['SLA']]
+    sla <- as.numeric(trait.samples[['SLA']])
     trait.samples[['SLA']] <- sla / DEFAULT.LEAF.C
   }
   
   ## convert leaf width / 1000
   if('leaf_width' %in% names(trait.samples)){
-    lw <- trait.samples[['leaf_width']]
+    lw <- as.numeric(trait.samples[['leaf_width']])
     trait.samples[['leaf_width']] <- lw / 1000.0
   }
   
   if('root_respiration_rate' %in% names(trait.samples)) {
-    rrr1 <- trait.samples[['root_respiration_rate']]
+    rrr1 <- as.numeric(trait.samples[['root_respiration_rate']])
     rrr2 <-  rrr1 * DEFAULT.MAINTENANCE.RESPIRATION
     trait.samples[['root_respiration_rate']] <- arrhenius.scaling(rrr2, old.temp = 25, 
                                                                   new.temp = 15)
   }
   
   if('Vcmax' %in% names(trait.samples)) {
-    vcmax <- trait.samples[['Vcmax']]
+    vcmax <- as.numeric(trait.samples[['Vcmax']])
     trait.samples[['Vcmax']] <- arrhenius.scaling(vcmax, old.temp = 25, new.temp = 15)
     
     ## Convert leaf_respiration_rate_m2 to dark_resp_factor; requires Vcmax
     if('leaf_respiration_rate_m2' %in% names(trait.samples)) {
-      leaf_resp = trait.samples[['leaf_respiration_rate_m2']]
+      leaf_resp = as.numeric(trait.samples[['leaf_respiration_rate_m2']])
       
       ## First scale variables to 15 degC
       trait.samples[['leaf_respiration_rate_m2']] <- 
@@ -66,9 +66,8 @@ convert.samples.ED <- function(trait.samples){
       trait.samples[['dark_respiration_factor']] <- trait.samples[['leaf_respiration_rate_m2']]/
         trait.samples[['Vcmax']]
       
-      ## Remove leaf_respiration_rate from trait samples -- NO LONGER NEEDED
-      #remove <- which(names(trait.samples)=='leaf_respiration_rate_m2')
-      #trait.samples = trait.samples[-remove]
+      ## Remove leaf_respiration_rate from trait samples
+      trait.samples$leaf_respiration_rate_m2 = NULL
       
     } ## End dark_respiration_factor loop
   } ## End Vcmax  
@@ -124,9 +123,21 @@ write.config.ED2 <- function(defaults, trait.values, settings, run.id){
     jobsh <- readLines(con=system.file("template.job", package = "PEcAn.ED2"), n=-1)
   }
   
+  # create host specific setttings
+  hostspecific <- ""
+  if (!is.null(settings$model$job.sh)) {
+    hostspecific <- paste(hostspecific, sep="\n", paste(settings$model$job.sh, collapse="\n"))
+  }
+  if (!is.null(settings$run$host$job.sh)) {
+    hostspecific <- paste(hostspecific, sep="\n", paste(settings$run$host$job.sh, collapse="\n"))
+  }
+
+  # create job.sh
+  jobsh <- gsub('@HOSTSPECIFIC@', hostspecific, jobsh)
+
   jobsh <- gsub('@SITE_LAT@', settings$run$site$lat, jobsh)
   jobsh <- gsub('@SITE_LON@', settings$run$site$lon, jobsh)
-  jobsh <- gsub('@SITE_MET@', settings$run$inputs$met, jobsh)
+  jobsh <- gsub('@SITE_MET@', settings$run$inputs$met$path, jobsh)
   
   jobsh <- gsub('@SCRATCH_COPY@', copyscratch, jobsh)
   jobsh <- gsub('@SCRATCH_CLEAR@', clearscratch, jobsh)
@@ -156,9 +167,6 @@ write.config.ED2 <- function(defaults, trait.values, settings, run.id){
     edhistory <- read.csv2(system.file("data/history.csv",  package="PEcAn.ED2"), sep=";")
   }
   edtraits <- names(edhistory)
-  edtraits <- edtraits[which(edtraits!="num")]
-  edtraits <- edtraits[which(edtraits!="include_pft")]
-  edtraits <- edtraits[which(edtraits!="include_pft_ag")]
   data(pftmapping)
   
   for(group in names(trait.values)){
@@ -169,42 +177,50 @@ write.config.ED2 <- function(defaults, trait.values, settings, run.id){
       ##
       
     } else {
-      ##is a PFT
-      pft <- defaults[[group]]
-      ## Insert PFT constants into output xml file  
-      pft.xml <- listToXml(pft$constants, 'pft')
-      ## Insert PFT names into output xml file
-      pft.xml <- append.xmlNode(pft.xml, xmlNode("name", pft$name))
-      
-      ##TODO this should come from the database
-      edpft <- pftmapping$ED[which(pftmapping==group)]
-      if (is.null(edpft)) {
-        logger.warn("No mapping found for", group, "using 1")
-        edpft <- 1
-      }
-      
       ## copy values
       if(!is.null(trait.values[[group]])){
-        vals <- convert.samples.ED(trait.values[[group]])
+        vals <- trait.values[[group]]
+        
+        # Add defaults (overriding for traits that were already assigned)
+        const = defaults[[group]]$constants
+        for(i in seq_along(const)) {
+          vals[[names(const)[i]]] = const[[i]]
+        }
+   
+        # Convert
+        vals <- convert.samples.ED(vals)
+        
+        # Fix names and remove traits that ED doesn't know about
         names(vals) <- droplevels(trait.lookup(names(vals))$model.id)
         traits <- names(vals)
         for(trait in traits) {
-          if (! trait %in% edtraits) {
+          if (! trait %in% edtraits ) {
             logger.error(trait, "not found in ED history")
+            vals[[trait]] = NULL
             next
           }
-          pft.xml <- append.xmlNode(pft.xml, xmlNode(trait, vals[trait]))
         }
       }
+
+      pft.xml <- listToXml(vals, 'pft')
+      
+      ## Insert PFT names into output xml file. Doesn't seem safe to RK to assume that defaults will contain a name, but leaving as is for now. 
+      pft.xml <- append.xmlNode(pft.xml, xmlNode("name", defaults[[group]]$name))
+      
+      ##TODO this should come from the database
       if (is.null(pft.xml[["num"]])) {
+        edpft <- pftmapping$ED[which(pftmapping==group)]
+        if (is.null(edpft)) {
+          logger.warn("No mapping found for", group, "using 1")
+          edpft <- 1
+        }
         pft.xml <- append.xmlNode(pft.xml, xmlNode("num", edpft))
-      } else {
-        xmlValue( pft.xml[["num"]]) <- edpft
       }
+      
       xml <- append.xmlNode(xml, pft.xml)
     }
   }
-  
+
   saveXML(xml, file = file.path(settings$rundir, run.id, "config.xml"), indent=TRUE, prefix = PREFIX_XML)
   
   startdate <- as.Date(settings$run$start.date)
@@ -237,7 +253,7 @@ write.config.ED2 <- function(defaults, trait.values, settings, run.id){
   
   ed2in.text <- gsub('@SITE_LAT@', settings$run$site$lat, ed2in.text)
   ed2in.text <- gsub('@SITE_LON@', settings$run$site$lon, ed2in.text)
-  ed2in.text <- gsub('@SITE_MET@', settings$run$inputs$met, ed2in.text)
+  ed2in.text <- gsub('@SITE_MET@', settings$run$inputs$me$path, ed2in.text)
   ed2in.text <- gsub('@MET_START@', metstart, ed2in.text)
   ed2in.text <- gsub('@MET_END@', metend, ed2in.text)
   
@@ -269,13 +285,13 @@ write.config.ED2 <- function(defaults, trait.values, settings, run.id){
   # Slightly overcomplicated to avoid error if path name happened to contain '.lat'
   
   # when pss or css not exists, case 0
-  if (is.null(settings$run$inputs$pss)|is.null(settings$run$inputs$css)){
+  if (is.null(settings$run$inputs$pss$path)|is.null(settings$run$inputs$css$path)){
     ed2in.text <- gsub('@INIT_MODEL@', 0, ed2in.text)
     ed2in.text <- gsub('@SITE_PSSCSS@', "", ed2in.text)
   }
   else{
-    prefix.pss <- sub(".lat.*", "", settings$run$inputs$css)
-    prefix.css <- sub(".lat.*", "", settings$run$inputs$pss)
+    prefix.pss <- sub(".lat.*", "", settings$run$inputs$css$path)
+    prefix.css <- sub(".lat.*", "", settings$run$inputs$pss$path)
     # pss and css prefix is not the same, kill
     if (!identical(prefix.pss , prefix.css)){
       logger.severe("ED2 css/pss/ files have different prefix")
@@ -284,8 +300,8 @@ write.config.ED2 <- function(defaults, trait.values, settings, run.id){
     else{
       value <- 2
       # site exists 
-      if (!is.null(settings$run$inputs$site)){
-        prefix.sites <- sub(".lat.*", "", settings$run$inputs$site)
+      if (!is.null(settings$run$inputs$site$path)){
+        prefix.sites <- sub(".lat.*", "", settings$run$inputs$site$path)
         # sites and pss have different prefix name, kill 
         if (!identical (prefix.sites, prefix.pss)){
           logger.severe("ED2 sites/pss/ files have different prefix")
@@ -303,12 +319,12 @@ write.config.ED2 <- function(defaults, trait.values, settings, run.id){
   
   ##----------------------------------------------------------------------
   
-  ed2in.text <- gsub('@ED_VEG@', settings$run$inputs$veg, ed2in.text)
-  ed2in.text <- gsub('@ED_SOIL@', settings$run$inputs$soil, ed2in.text)
-  ed2in.text <- gsub('@ED_LU@', settings$run$inputs$lu, ed2in.text)
-  ed2in.text <- gsub('@ED_THSUM@', ifelse(str_sub(settings$run$inputs$thsum, -1) == "/",
-                                          settings$run$inputs$thsum,
-                                          paste0(settings$run$inputs$thsum, "/")), ed2in.text)
+  ed2in.text <- gsub('@ED_VEG@', settings$run$inputs$veg$path, ed2in.text)
+  ed2in.text <- gsub('@ED_SOIL@', settings$run$inputs$soil$path, ed2in.text)
+  ed2in.text <- gsub('@ED_LU@', settings$run$inputs$lu$path, ed2in.text)
+  ed2in.text <- gsub('@ED_THSUM@', ifelse(str_sub(settings$run$inputs$thsum$path, -1) == "/",
+                                          settings$run$inputs$thsum$path,
+                                          paste0(settings$run$inputs$thsum$path, "/")), ed2in.text)
   
   ##----------------------------------------------------------------------
   ed2in.text <- gsub('@START_MONTH@', format(startdate, "%m"), ed2in.text)
